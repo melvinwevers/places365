@@ -8,10 +8,17 @@ import os
 import shutil
 import time
 
+import numpy as np
+
 import matplotlib.pyplot as plt
 import torch.optim as optim
 
 from torch.optim import lr_scheduler
+
+from PIL import Image
+
+
+import math
 
 import torch
 import torch.nn as nn
@@ -22,6 +29,7 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from torch.utils.data.sampler import SubsetRandomSampler
 
 import wideresnet
 import pdb
@@ -74,14 +82,115 @@ import copy
 
 # Data augmentation and normalization for training
 # Just normalization for validation
+
+data_dir = '../src/data/'
+arch = 'resnet50'
+num_classes = 365
+new_classes = 242
+batch_size = 32
+num_epochs = 25
+
+# Flag for feature extracting. When False, we finetune the whole model,
+#   when True we only update the reshaped layer params
+
+feature_extract = True
+
+# Flag for feature extracting. When False, we finetune the whole model,
+#   when True we only update the reshaped la
+
+# model.eval()
+
+
+def set_parameter_requires_grad(model, feature_extracting):
+    if feature_extracting:
+        # for param in model.parameters():
+        #    param.requires_grad = False
+        for name, child in model.named_children():
+            if name in ['layer3', 'layer4']:
+                print(name + ' is unfrozen')
+                for param in child.parameters():
+                    param.requires_grad = True
+            else:
+                print(name + ' is frozen')
+                for param in child.parameters():
+                    param.requires_grad = False
+
+
+def cyclical_lr(step_sz, min_lr=0.001, max_lr=1, mode='triangular', scale_func=None, scale_md='cycles', gamma=1.):
+    if scale_func == None:
+        if mode == 'triangular':
+            def scale_fn(x): return 1.
+            scale_mode = 'cycles'
+        elif mode == 'triangular2':
+            def scale_fn(x): return 1 / (2.**(x - 1))
+            scale_mode = 'cycles'
+        elif mode == 'exp_range':
+            def scale_fn(x): return gamma**(x)
+            scale_mode = 'iterations'
+        else:
+            raise ValueError(f'The {mode} is not valid value!')
+    else:
+        scale_fn = scale_func
+        scale_mode = scale_md
+
+    def lr_lambda(iters): return min_lr + (max_lr - min_lr) * \
+        rel_val(iters, step_sz, scale_mode)
+
+    def rel_val(iteration, stepsize, mode):
+        cycle = math.floor(1 + iteration / (2 * stepsize))
+        x = abs(iteration / stepsize - 2 * cycle + 1)
+        if mode == 'cycles':
+            return max(0, (1 - x)) * scale_fn(cycle)
+        elif mode == 'iterations':
+            return max(0, (1 - x)) * scale_fn(iteration)
+        else:
+            raise ValueError(f'The {scale_mode} is not valid value!')
+    return lr_lambda
+
+
+def initialize_model(arch, num_classes, new_classes, feature_extract):
+    model_ft = None
+    input_size = 0
+
+    if arch == 'resnet50':
+        # load the pre-trained weights
+        model_file = '%s_places365.pth.tar' % arch
+        if not os.access(model_file, os.W_OK):
+            weight_url = 'http://places2.csail.mit.edu/models_places365/' + model_file
+            os.system('wget ' + weight_url)
+        model_ft = models.__dict__[arch](num_classes=num_classes)
+        checkpoint = torch.load(
+            model_file, map_location=lambda storage, loc: storage)
+        state_dict = {str.replace(k, 'module.', ''): v for k,
+                      v in checkpoint['state_dict'].items()}
+        model_ft.load_state_dict(state_dict)
+        set_parameter_requires_grad(model_ft, feature_extract)
+        num_ftrs = model_ft.fc.in_features
+        model_ft.fc = nn.Linear(num_ftrs, new_classes)
+        input_size = 224
+    else:
+        print("invalid model name, exiting")
+        exit()
+
+    return model_ft, input_size
+
+
+model_ft, input_size = initialize_model(arch, num_classes, new_classes,
+                                        feature_extract)
+
+# print(model_ft)
+
+
 data_transforms = {
     'train': transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(hue=.05, saturation=.05),
+        transforms.RandomRotation(20, resample=Image.BILINEAR),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ]),
-    'val': transforms.Compose([
+    'validation': transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
@@ -89,62 +198,66 @@ data_transforms = {
     ]),
 }
 
-data_dir = '../places_boer/'
-image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x),
-                                          data_transforms[x])
-                  for x in ['train', 'val']}
-dataloaders = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=64,
-                                              shuffle=True, num_workers=6)
-               for x in ['train', 'val']}
-dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val']}
-class_names = image_datasets['train'].classes
+print('initializing datasets and dataloaders....')
+
+image_datasets = {x: datasets.ImageFolder(os.path.join(data_dir, x), data_transforms[x]) for x in ['train', 'validation']}
+
+# Create training and validation dataloaders
+dataloaders_dict = {x: torch.utils.data.DataLoader(image_datasets[x], batch_size=batch_size, shuffle=True, num_workers=8) for x in ['train', 'validation']}
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-arch = 'resnet50'
+model_ft = model_ft.to(device)
+
+# Gather the parameters to be optimized/updated in this run. If we are
+#  finetuning we will be updating all parameters. However, if we are
+#  doing feature extract method, we will only update the parameters
+#  that we have just initialized, i.e. the parameters with requires_grad
+#  is True.
+params_to_update = model_ft.parameters()
+print("Params to learn:")
+if feature_extract:
+    params_to_update = []
+    for name, param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            params_to_update.append(param)
+            print("\t", name)
+else:
+    for name, param in model_ft.named_parameters():
+        if param.requires_grad == True:
+            print("\t", name)
+
+# Observe that all parameters are being optimized
 
 
-# load the pre-trained weights
-model_file = '%s_places365.pth.tar' % arch
-if not os.access(model_file, os.W_OK):
-    weight_url = 'http://places2.csail.mit.edu/models_places365/' + model_file
-    os.system('wget ' + weight_url)
+#optimizer_ft = optim.SGD(params_to_update, lr=0.001, momentum=0.9)
+step_size = 400
+optimizer_ft = optim.SGD(params_to_update, lr=1.)
+clr = cyclical_lr(step_size, min_lr=0.001, max_lr=1, mode='triangular2')
+scheduler = lr_scheduler.LambdaLR(optimizer_ft, [clr])
 
-model = models.__dict__[arch](num_classes=365)
-checkpoint = torch.load(model_file, map_location=lambda storage, loc: storage)
-state_dict = {str.replace(k, 'module.', ''): v for k,
-              v in checkpoint['state_dict'].items()}
-model.load_state_dict(state_dict)
-
-# model.eval()
-
-# for param in model.parameters():
-#    param.requires_grad = False
-
-num_ftrs = model.fc.in_features
-
-model.fc = nn.Linear(num_ftrs, 132)
-
-model = model.to(device)
-
+# print(optimizer_ft)
 
 criterion = nn.CrossEntropyLoss()
 
 
 # Observe that all parameters are being optimized
-optimizer_ft = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+#optimizer_ft = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
 
 # Decay LR by a factor of 0.1 every 7 epochs
-exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
+#exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=7, gamma=0.1)
 
 
-def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
-    batch_time = AverageMeter()
+def train_model(model, dataloaders, criterion, optimizer, scheduler,
+                num_epochs=num_epochs):
+    # batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
 
     since = time.time()
+
+    val_acc_history = []
 
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
@@ -154,7 +267,7 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
         print('-' * 10)
 
         # Each epoch has a training and validation phase
-        for phase in ['train', 'val']:
+        for phase in ['train', 'validation']:
             if phase == 'train':
                 model.train()  # Set model to training mode
             else:
@@ -195,8 +308,8 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
             if phase == 'train':
                 scheduler.step()
 
-            epoch_loss = running_loss / dataset_sizes[phase]
-            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+            epoch_loss = running_loss / len(dataloaders[phase].dataset)
+            epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
 
             print('{} Loss: {:.4f} Acc: {:.4f}'.format(
                 phase, epoch_loss, epoch_acc))
@@ -211,6 +324,8 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
             if phase == 'val' and epoch_acc > best_acc:
                 best_acc = epoch_acc
                 best_model_wts = copy.deepcopy(model.state_dict())
+            if phase == 'val':
+                val_acc_history.append(epoch_acc)
 
         print()
 
@@ -221,7 +336,7 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
 
     # load best model weights
     model.load_state_dict(best_model_wts)
-    return model
+    return model, val_acc_history
 
 
 def visualize_model(model, num_images=6):
@@ -293,243 +408,9 @@ def accuracy(output, target, topk=(1,)):
     return res
 
 
-def main():
-    model_ft = train_model(model, criterion, optimizer_ft, exp_lr_scheduler,
-                           num_epochs=25)
-    visualize_model(model_ft)
-
-# def main():
-#     global args, best_prec1
-#     args = parser.parse_args()
-#     print(args)
-#     # create model
-#     print("=> creating model '{}'".format(args.arch))
-#     if args.arch.lower().startswith('wideresnet'):
-#         # a customized resnet model with last feature map size as 14x14 for better class activation mapping
-#         model = wideresnet.resnet50(num_classes=args.num_classes)
-#     else:
-#         model = models.__dict__[args.arch](num_classes=args.num_classes)
-
-#     if args.arch.lower().startswith('alexnet') or args.arch.lower().startswith('vgg'):
-#         model.features = torch.nn.DataParallel(model.features)
-#         model.cuda()
-#     else:
-#         model = torch.nn.DataParallel(model).cuda()
-#     print(model)
-#     # optionally resume from a checkpoint
-#     if args.resume:
-#         if os.path.isfile(args.resume):
-#             print("=> loading checkpoint '{}'".format(args.resume))
-#             checkpoint = torch.load(args.resume)
-#             args.start_epoch = checkpoint['epoch']
-#             best_prec1 = checkpoint['best_prec1']
-#             model.load_state_dict(checkpoint['state_dict'])
-#             print("=> loaded checkpoint '{}' (epoch {})"
-#                   .format(args.resume, checkpoint['epoch']))
-#         else:
-#             print("=> no checkpoint found at '{}'".format(args.resume))
-
-#     cudnn.benchmark = True
-
-#     # Data loading code
-#     traindir = os.path.join(args.data, 'train')
-#     valdir = os.path.join(args.data, 'val')
-#     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-#                                      std=[0.229, 0.224, 0.225])
-
-#     train_loader = torch.utils.data.DataLoader(
-#         datasets.ImageFolder(traindir, transforms.Compose([
-#             transforms.RandomSizedCrop(224),
-#             transforms.RandomHorizontalFlip(),
-#             transforms.ToTensor(),
-#             normalize,
-#         ])),
-#         batch_size=args.batch_size, shuffle=True,
-#         num_workers=args.workers, pin_memory=True)
-
-#     val_loader = torch.utils.data.DataLoader(
-#         datasets.ImageFolder(valdir, transforms.Compose([
-#             transforms.Scale(256),
-#             transforms.CenterCrop(224),
-#             transforms.ToTensor(),
-#             normalize,
-#         ])),
-#         batch_size=args.batch_size, shuffle=False,
-#         num_workers=args.workers, pin_memory=True)
-
-#     # define loss function (criterion) and pptimizer
-#     criterion = nn.CrossEntropyLoss().cuda()
-
-#     optimizer = torch.optim.SGD(model.parameters(), args.lr,
-#                                 momentum=args.momentum,
-#                                 weight_decay=args.weight_decay)
-
-#     if args.evaluate:
-#         validate(val_loader, model, criterion)
-#         return
-
-#     for epoch in range(args.start_epoch, args.epochs):
-#         adjust_learning_rate(optimizer, epoch)
-
-#         # train for one epoch
-#         train(train_loader, model, criterion, optimizer, epoch)
-
-#         # evaluate on validation set
-#         prec1 = validate(val_loader, model, criterion)
-
-#         # remember best prec@1 and save checkpoint
-#         is_best = prec1 > best_prec1
-#         best_prec1 = max(prec1, best_prec1)
-#         save_checkpoint({
-#             'epoch': epoch + 1,
-#             'arch': args.arch,
-#             'state_dict': model.state_dict(),
-#             'best_prec1': best_prec1,
-#         }, is_best, args.arch.lower())
-
-
-# def train(train_loader, model, criterion, optimizer, epoch):
-#     batch_time = AverageMeter()
-#     data_time = AverageMeter()
-#     losses = AverageMeter()
-#     top1 = AverageMeter()
-#     top5 = AverageMeter()
-
-#     # switch to train mode
-#     model.train()
-
-#     end = time.time()
-#     for i, (input, target) in enumerate(train_loader):
-#         # measure data loading time
-#         data_time.update(time.time() - end)
-
-#         target = target.cuda(async=True)
-#         input_var = torch.autograd.Variable(input)
-#         target_var = torch.autograd.Variable(target)
-#         # compute output
-#         output = model(input_var)
-#         loss = criterion(output, target_var)
-
-#         # measure accuracy and record loss
-#         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-#         losses.update(loss.data[0], input.size(0))
-#         top1.update(prec1[0], input.size(0))
-#         top5.update(prec5[0], input.size(0))
-
-#         # compute gradient and do SGD step
-#         optimizer.zero_grad()
-#         loss.backward()
-#         optimizer.step()
-
-#         # measure elapsed time
-#         batch_time.update(time.time() - end)
-#         end = time.time()
-
-#         if i % args.print_freq == 0:
-#             print('Epoch: [{0}][{1}/{2}]\t'
-#                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-#                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-#                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-#                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-#                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-#                       epoch, i, len(train_loader), batch_time=batch_time,
-#                       data_time=data_time, loss=losses, top1=top1, top5=top5))
-
-
-# def fine_tune(model)
-
-
-# def validate(val_loader, model, criterion):
-#     batch_time = AverageMeter()
-#     losses = AverageMeter()
-#     top1 = AverageMeter()
-#     top5 = AverageMeter()
-
-#     # switch to evaluate mode
-#     model.eval()
-
-#     end = time.time()
-#     for i, (input, target) in enumerate(val_loader):
-#         target = target.cuda(async=True)
-#         input_var = torch.autograd.Variable(input, volatile=True)
-#         target_var = torch.autograd.Variable(target, volatile=True)
-
-#         # compute output
-#         output = model(input_var)
-#         loss = criterion(output, target_var)
-
-#         # measure accuracy and record loss
-#         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-#         losses.update(loss.data[0], input.size(0))
-#         top1.update(prec1[0], input.size(0))
-#         top5.update(prec5[0], input.size(0))
-
-#         # measure elapsed time
-#         batch_time.update(time.time() - end)
-#         end = time.time()
-
-#         if i % args.print_freq == 0:
-#             print('Test: [{0}/{1}]\t'
-#                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-#                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-#                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-#                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-#                       i, len(val_loader), batch_time=batch_time, loss=losses,
-#                       top1=top1, top5=top5))
-
-#     print(' * Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f}'
-#           .format(top1=top1, top5=top5))
-
-#     return top1.avg
-
-
-# def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-#     torch.save(state, filename + '_latest.pth.tar')
-#     if is_best:
-#         shutil.copyfile(filename + '_latest.pth.tar',
-#                         filename + '_best.pth.tar')
-
-
-# class AverageMeter(object):
-#     """Computes and stores the average and current value"""
-
-#     def __init__(self):
-#         self.reset()
-
-#     def reset(self):
-#         self.val = 0
-#         self.avg = 0
-#         self.sum = 0
-#         self.count = 0
-
-#     def update(self, val, n=1):
-#         self.val = val
-#         self.sum += val * n
-#         self.count += n
-#         self.avg = self.sum / self.count
-
-
-# def adjust_learning_rate(optimizer, epoch):
-#     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-#     lr = args.lr * (0.1 ** (epoch // 30))
-#     for param_group in optimizer.param_groups:
-#         param_group['lr'] = lr
-
-
-# def accuracy(output, target, topk=(1,)):
-#     """Computes the precision@k for the specified values of k"""
-#     maxk = max(topk)
-#     batch_size = target.size(0)
-
-#     _, pred = output.topk(maxk, 1, True, True)
-#     pred = pred.t()
-#     correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-#     res = []
-#     for k in topk:
-#         correct_k = correct[:k].view(-1).float().sum(0)
-#         res.append(correct_k.mul_(100.0 / batch_size))
-#     return res
+model_ft = train_model(model_ft, dataloaders_dict, criterion, optimizer_ft,
+                       scheduler, num_epochs=num_epochs)
+visualize_model(model_ft)
 
 
 if __name__ == '__main__':
